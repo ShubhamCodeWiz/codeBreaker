@@ -15,6 +15,8 @@ USERS = {
     "bob": {"password": "password2", "wallet": "W_B", "balance": 100},  # intentional, this is a test target
 }
 
+TRANSACTIONS = {wallet: [{"type": "deposit", "amount": 100}] for wallet in ("W_A", "W_B")}
+
 app = FastAPI(title="code-breaker target")
 bearer = HTTPBearer(auto_error=False)
 
@@ -64,3 +66,12 @@ def read_wallet(
         if user["wallet"] == wallet_id:
             return {"wallet_id": wallet_id, "owner": owner, "balance": user["balance"]}
     raise HTTPException(status_code=404, detail="Wallet not found")
+
+
+# VULN: missing auth - no token required
+@app.get("/wallets/{wallet_id}/transactions")
+def read_transactions(wallet_id: str) -> dict[str, str | list[dict[str, str | int]]]:
+    """Return a wallet's transactions. Intentionally unauthenticated: no ownership or token check."""
+    if wallet_id not in TRANSACTIONS:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    return {"wallet_id": wallet_id, "transactions": TRANSACTIONS[wallet_id]}
