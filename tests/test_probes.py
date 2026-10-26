@@ -8,7 +8,11 @@ because /wallets/{id} genuinely requires a token.
 import httpx
 
 from code_breaker.harness import run_target
-from code_breaker.probes import idor_probe, unauthenticated_access_probe
+from code_breaker.probes import (
+    idor_probe,
+    idempotency_probe,
+    unauthenticated_access_probe,
+)
 
 ALICE = {"username": "alice", "password": "password1", "wallet_id": "W_A"}
 ALICE_CREDS = {"username": "alice", "password": "password1"}
@@ -112,6 +116,50 @@ def test_unauth_probe_never_leaks_token() -> None:
         result = unauthenticated_access_probe(
             str(server), ALICE_CREDS, "/wallets/W_B/transactions"
         )
+    serialized = result.model_dump_json()
+    assert token not in serialized
+    assert ALICE["password"] not in serialized
+
+# Idempotency PASS is proven in a later session against a patched copy,
+# because the current target is the vulnerable one.
+def test_idempotency_probe_fails_on_vulnerable_target() -> None:
+    with run_target() as server:
+        result = idempotency_probe(str(server), ALICE_CREDS, "W_A", amount=20)
+    assert result.status == "FAIL"
+    withdraws = [item for item in result.evidence if item.path.endswith("/withdraw")]
+    assert len(withdraws) == 2
+    assert "balance before: 100" in [item.note for item in result.evidence]
+    assert "balance after: 60" in [item.note for item in result.evidence]
+
+
+def test_idempotency_probe_inconclusive_on_low_balance() -> None:
+    with run_target() as server:
+        result = idempotency_probe(str(server), ALICE_CREDS, "W_A", amount=60)
+    assert result.status == "INCONCLUSIVE"
+    assert not any(item.path.endswith("/withdraw") for item in result.evidence)
+
+
+def test_idempotency_probe_inconclusive_on_bad_credentials() -> None:
+    bad_user = {**ALICE_CREDS, "password": "wrong-password"}
+    with run_target() as server:
+        result = idempotency_probe(str(server), bad_user, "W_A")
+    assert result.status == "INCONCLUSIVE"
+    assert len(result.evidence) == 1
+
+
+def test_idempotency_probe_inconclusive_on_forbidden_wallet() -> None:
+    with run_target() as server:
+        result = idempotency_probe(str(server), ALICE_CREDS, "W_B")
+    assert result.status == "INCONCLUSIVE"
+    withdraws = [item for item in result.evidence if item.path.endswith("/withdraw")]
+    assert len(withdraws) == 1
+    assert withdraws[0].status_code == 403
+
+
+def test_idempotency_probe_never_leaks_token() -> None:
+    with run_target() as server:
+        token = _fetch_token(str(server))
+        result = idempotency_probe(str(server), ALICE_CREDS, "W_A")
     serialized = result.model_dump_json()
     assert token not in serialized
     assert ALICE["password"] not in serialized
