@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 import jwt
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
@@ -75,3 +75,32 @@ def read_transactions(wallet_id: str) -> dict[str, str | list[dict[str, str | in
     if wallet_id not in TRANSACTIONS:
         raise HTTPException(status_code=404, detail="Wallet not found")
     return {"wallet_id": wallet_id, "transactions": TRANSACTIONS[wallet_id]}
+
+
+class WithdrawRequest(BaseModel):
+    """Amount to withdraw."""
+
+    amount: int
+
+
+@app.post("/wallets/{wallet_id}/withdraw")
+def withdraw(
+    wallet_id: str,
+    payload: WithdrawRequest,
+    username: Annotated[str, Depends(get_current_user)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> dict[str, str | int]:
+    """Withdraw funds. Intentionally ignores Idempotency-Key, so retrying a key debits twice."""
+    user = USERS[username]
+    if wallet_id not in TRANSACTIONS:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    if user["wallet"] != wallet_id:
+        raise HTTPException(status_code=403, detail="Wallet does not belong to you")
+    if payload.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive")
+    if user["balance"] < payload.amount:
+        raise HTTPException(status_code=400, detail="Insufficient funds")
+    # VULN: Idempotency-Key accepted but ignored
+    user["balance"] -= payload.amount
+    TRANSACTIONS[wallet_id].append({"type": "withdraw", "amount": payload.amount})
+    return {"wallet_id": wallet_id, "balance": user["balance"]}
