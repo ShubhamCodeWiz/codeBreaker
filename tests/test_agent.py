@@ -97,6 +97,49 @@ def test_agent_happy_path() -> None:
     assert "403" in outcome["diff"]
 
 
+LIVE_STEPS = [
+    ("list_target_endpoints", {}),
+    ("run_idor_probe", {"path_template": "/wallets/{wallet_id}"}),
+    ("list_target_files", {}),
+    ("read_target_file", {"rel_path": MAIN}),
+    ("apply_patch", {"rel_path": MAIN, "old": IDOR_OLD, "new": IDOR_NEW}),
+    ("run_idor_probe", {"path_template": "/wallets/{wallet_id}"}),
+]
+
+
+def test_summary_comes_from_the_transcript_on_the_live_sequence() -> None:
+    """The live provider can split its messages differently; the tools still tell the story."""
+    workspace = make_workspace(REPO_ROOT)
+    try:
+        with run_target(app_dir=str(workspace)) as server:
+            agent = build_agent(scripted_model(LIVE_STEPS))
+            deps = _deps(str(server), workspace)
+            outcome = run_idor_agent(agent, deps)
+    finally:
+        cleanup_workspace(workspace)
+
+    assert [entry["tool"] for entry in deps.transcript] == [name for name, _ in LIVE_STEPS]
+    assert outcome["endpoint_tried"] == "/wallets/{wallet_id}"
+    assert outcome["attempts"] == 1
+    assert outcome["final_status"] == "PASS"
+    assert outcome["diff"]
+
+
+def test_no_probe_call_reports_not_run_without_crashing() -> None:
+    workspace = make_workspace(REPO_ROOT)
+    try:
+        with run_target(app_dir=str(workspace)) as server:
+            steps = [("list_target_files", {}), ("read_target_file", {"rel_path": MAIN})]
+            agent = build_agent(scripted_model(steps))
+            outcome = run_idor_agent(agent, _deps(str(server), workspace))
+    finally:
+        cleanup_workspace(workspace)
+
+    assert outcome["final_status"] == "NOT_RUN"
+    assert outcome["endpoint_tried"] is None
+    assert outcome["attempts"] == 0
+
+
 def test_agent_gives_up_after_max_attempts() -> None:
     workspace = make_workspace(REPO_ROOT)
     try:

@@ -8,21 +8,24 @@ import sys
 import traceback
 from pathlib import Path
 
-from dotenv import load_dotenv
-from pydantic_ai.exceptions import UsageLimitExceeded
-from rich.console import Console
-from rich.text import Text
+# Must be set before pydantic_ai is imported anywhere, so the CLI prints no banner.
+os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
 
-from code_breaker.agent import (
+from dotenv import load_dotenv  # noqa: E402
+from pydantic_ai.exceptions import UsageLimitExceeded  # noqa: E402
+from rich.console import Console  # noqa: E402
+from rich.text import Text  # noqa: E402
+
+from code_breaker.agent import (  # noqa: E402
     AgentDeps,
     RepeatedToolCallError,
     build_agent,
     run_idor_agent,
 )
-from code_breaker.harness import run_target
-from code_breaker.patch import cleanup_workspace, make_workspace
-from code_breaker.report import render_comparison, render_report
-from code_breaker.scan import run_probes
+from code_breaker.harness import run_target  # noqa: E402
+from code_breaker.patch import cleanup_workspace, make_workspace  # noqa: E402
+from code_breaker.report import render_comparison, render_report  # noqa: E402
+from code_breaker.scan import run_probes  # noqa: E402
 
 DEFAULT_MODEL = "groq:openai/gpt-oss-120b"
 REPO_ROOT = Path(__file__).resolve().parents[1]

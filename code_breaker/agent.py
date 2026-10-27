@@ -7,7 +7,6 @@ from pathlib import Path
 
 import httpx
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.messages import ToolCallPart, ToolReturnPart
 from pydantic_ai.usage import UsageLimits
 
 from code_breaker import patch
@@ -227,6 +226,35 @@ def build_agent(model=None) -> Agent[AgentDeps, str]:
     return agent
 
 
+def _summary(transcript: list[dict]) -> dict:
+    """Read the run's headline facts from the tool traffic, never from the model's prose."""
+    endpoint_tried: str | None = None
+    final_status = "NOT_RUN"
+    attempts = 0
+    diff: str | None = None
+
+    for entry in transcript:
+        tool = entry.get("tool")
+        args = entry.get("args")
+        result = entry.get("result")
+        if tool == "run_idor_probe":
+            if isinstance(args, dict):
+                endpoint_tried = args.get("path_template", endpoint_tried)
+            if isinstance(result, dict) and "status" in result:
+                final_status = str(result["status"])
+        elif tool == "apply_patch":
+            attempts += 1
+            if isinstance(result, dict) and result.get("ok") is True and result.get("diff"):
+                diff = str(result["diff"])
+
+    return {
+        "endpoint_tried": endpoint_tried,
+        "final_status": final_status,
+        "attempts": attempts,
+        "diff": diff,
+    }
+
+
 def run_idor_agent(
     agent: Agent[AgentDeps, str],
     deps: AgentDeps,
@@ -237,12 +265,10 @@ def run_idor_agent(
 
     Each run_sync call carries a hard UsageLimits request cap, and the tools
     refuse an identical third call, so neither the model nor the loop can spin.
-    The return values come from the tool traffic, not from the model's prose.
+    The return values are derived from deps.transcript, which records every tool
+    call and its result, so they survive how a provider splits its messages.
     """
-    endpoint_tried: str | None = None
-    final_status = "INCONCLUSIVE"
-    attempts = 0
-    diff: str | None = None
+    summary = _summary(deps.transcript)
     usage: dict | None = None
     history = None
 
@@ -254,8 +280,8 @@ def run_idor_agent(
 
         deps.restart = restart
 
-        while attempts < max_attempts and final_status != "PASS":
-            patches_before = attempts
+        while summary["attempts"] < max_attempts and summary["final_status"] != "PASS":
+            patches_before = summary["attempts"]
             deps.turn_start = len(deps.transcript)
             result = agent.run_sync(
                 USER_PROMPT,
@@ -269,27 +295,8 @@ def run_idor_agent(
             if run_usage is not None and hasattr(run_usage, "model_dump"):
                 usage = run_usage.model_dump()
 
-            for message in result.new_messages():
-                for part in getattr(message, "parts", []):
-                    if isinstance(part, ToolCallPart) and part.tool_name == "run_idor_probe":
-                        if isinstance(part.args, dict):
-                            endpoint_tried = part.args.get("path_template", endpoint_tried)
-                    elif isinstance(part, ToolCallPart) and part.tool_name == "apply_patch":
-                        attempts += 1
-                    elif isinstance(part, ToolReturnPart) and part.tool_name == "run_idor_probe":
-                        if isinstance(part.content, dict):
-                            final_status = str(part.content.get("status", final_status))
-                    elif isinstance(part, ToolReturnPart) and part.tool_name == "apply_patch":
-                        if isinstance(part.content, dict) and part.content.get("diff"):
-                            diff = str(part.content["diff"])
-
-            if attempts == patches_before:
+            summary = _summary(deps.transcript)
+            if summary["attempts"] == patches_before:
                 break
 
-    return {
-        "endpoint_tried": endpoint_tried,
-        "final_status": final_status,
-        "attempts": attempts,
-        "diff": diff,
-        "usage": usage,
-    }
+    return {**summary, "usage": usage}
