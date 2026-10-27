@@ -3,7 +3,9 @@
 import argparse
 import json
 import os
+import re
 import sys
+import traceback
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -20,7 +22,72 @@ DEFAULT_MODEL = "groq:openai/gpt-oss-120b"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ALICE = {"username": "alice", "password": "password1", "wallet_id": "W_A"}
 MISSING_KEY_HINT = "copy .env.example to .env and fill in GROQ_API_KEY."
-FAILURE_HINT = "model call failed (rate limit, network or bad key); check your key and retry."
+FAILURE_HINT = "the run stopped here; re-run with --debug for the tool transcript."
+CLIP_CHARS = 300
+
+REDACTIONS = (
+    re.compile(r"Bearer[ \t]+\S+", re.IGNORECASE),
+    re.compile(r"gsk_[A-Za-z0-9_\-]{6,}"),
+    re.compile(r"\b[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b"),
+    re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|password)\b\s*[:=]\s*[\"']?[^\s,}\"']{4,}"),
+)
+
+
+def _scrub(text: str) -> str:
+    """Replace anything token- or key-shaped before it can reach the terminal."""
+    for pattern in REDACTIONS:
+        text = pattern.sub("<redacted>", text)
+    return text
+
+
+def _clip(value: object, limit: int = CLIP_CHARS) -> str:
+    """Scrub a value and truncate it for the transcript."""
+    text = _scrub(str(value))
+    return text if len(text) <= limit else f"{text[:limit]}…"
+
+
+def _status_code(error: BaseException) -> int | None:
+    for candidate in (
+        getattr(error, "status_code", None),
+        getattr(getattr(error, "response", None), "status_code", None),
+    ):
+        if isinstance(candidate, int):
+            return candidate
+    return None
+
+
+def _describe_error(error: BaseException, model_name: str) -> str:
+    """Class name, module, HTTP status and model name. Never the message."""
+    parts = [f"{type(error).__module__}.{type(error).__name__}"]
+    status = _status_code(error)
+    if status is not None:
+        parts.append(f"HTTP {status}")
+    parts.append(f"model={model_name}")
+    parts.append(FAILURE_HINT)
+    return " | ".join(parts)
+
+
+def _traceback_without_message() -> str:
+    """Frames only: the final 'ExceptionType: message' line is replaced by the type."""
+    exc_type, exc, tb = sys.exc_info()
+    if exc_type is None:
+        return ""
+    lines = traceback.format_exception(exc_type, exc, tb)
+    lines[-1] = f"{exc_type.__module__}.{exc_type.__name__}\n"
+    return "".join(lines)
+
+
+def _render_transcript(deps: AgentDeps | None, usage: dict | None, console: Console) -> None:
+    """Print every tool call the model made, clipped and scrubbed, plus usage."""
+    console.print(Text("--- transcript ---", style="bold"))
+    entries = deps.transcript if deps is not None else []
+    if not entries:
+        console.print(Text("(no tool calls recorded)"))
+    for entry in entries:
+        console.print(Text(f"tool: {entry['tool']}"))
+        console.print(Text(f"  args: {_clip(entry['args'])}"))
+        console.print(Text(f"  result: {_clip(entry['result'])}"))
+    console.print(Text(f"usage: {usage if usage else 'unavailable'}"))
 
 
 def _payload(results_before, results_after, outcome) -> dict:
@@ -44,6 +111,11 @@ def main(argv: list[str] | None = None) -> int:
         description="Probe the original target, let the agent fix IDOR, then compare.",
     )
     parser.add_argument("--save", type=Path, default=None, help="write the run report as JSON here")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="on failure, also print the tool transcript, usage and a message-free traceback",
+    )
     args = parser.parse_args(argv)
 
     load_dotenv()
@@ -55,6 +127,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     workspace: Path | None = None
+    deps: AgentDeps | None = None
+    usage: dict | None = None
     try:
         console.print(Text("BEFORE: probing the original target", style="bold"))
         with run_target() as server:
@@ -71,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
                 victim_wallet_id="W_B",
             )
             outcome = run_idor_agent(agent, deps)
+        usage = outcome["usage"]
 
         console.print(
             Text(
@@ -96,8 +171,15 @@ def main(argv: list[str] | None = None) -> int:
                 encoding="utf-8",
             )
             console.print(Text(f"saved report to {args.save}"))
-    except Exception as error:  # noqa: BLE001 - never leak the message, it may hold secrets
-        console.print(Text(f"{type(error).__name__}: {FAILURE_HINT}", style="red"))
+
+        if args.debug:
+            _render_transcript(deps, usage, console)
+    except Exception as error:  # noqa: BLE001 - diagnose without ever printing the message
+        console.print(Text(_describe_error(error, model_name), style="red"))
+        if args.debug:
+            _render_transcript(deps, usage, console)
+            console.print(Text("--- traceback (message removed) ---", style="bold"))
+            console.print(Text(_traceback_without_message()))
         return 1
     finally:
         if workspace is not None:

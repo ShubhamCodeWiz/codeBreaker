@@ -143,3 +143,48 @@ def test_agent_never_patches_outside_workspace(bad_path: str) -> None:
         assert 'SECRET_KEY = "super-secret-key"' in read_file(workspace, MAIN)
     finally:
         cleanup_workspace(workspace)
+
+def test_read_target_file_bad_path_is_reported_to_the_model() -> None:
+    """A rejected path comes back as an error the model can correct, not a crash."""
+    workspace = make_workspace(REPO_ROOT)
+    try:
+        with run_target(app_dir=str(workspace)) as server:
+            steps = [
+                ("read_target_file", {"rel_path": "../main.py"}),
+                ("read_target_file", {"rel_path": MAIN}),
+            ]
+            agent = build_agent(scripted_model(steps))
+            deps = _deps(str(server), workspace)
+            outcome = run_idor_agent(agent, deps)
+    finally:
+        cleanup_workspace(workspace)
+
+    rejected, accepted = deps.transcript
+    assert rejected["tool"] == "read_target_file"
+    assert rejected["result"]["ok"] is False
+    assert rejected["result"]["error"] == "ValueError"
+    assert "def get_current_user" in accepted["result"]
+    assert outcome["final_status"] != "PASS"
+
+
+def test_apply_patch_bad_path_is_reported_to_the_model() -> None:
+    """A rejected edit comes back as ok=False with a reason, then the good edit applies."""
+    workspace = make_workspace(REPO_ROOT)
+    try:
+        with run_target(app_dir=str(workspace)) as server:
+            steps = [
+                ("apply_patch", {"rel_path": "../main.py", "old": IDOR_OLD, "new": IDOR_NEW}),
+                ("apply_patch", {"rel_path": MAIN, "old": IDOR_OLD, "new": IDOR_NEW}),
+            ]
+            agent = build_agent(scripted_model(steps))
+            deps = _deps(str(server), workspace)
+            run_idor_agent(agent, deps, max_attempts=2)
+    finally:
+        cleanup_workspace(workspace)
+
+    rejected, accepted = deps.transcript
+    assert rejected["tool"] == "apply_patch"
+    assert rejected["result"]["ok"] is False
+    assert "escapes" in rejected["result"]["message"]
+    assert accepted["result"]["ok"] is True
+    assert "403" in accepted["result"]["diff"]
