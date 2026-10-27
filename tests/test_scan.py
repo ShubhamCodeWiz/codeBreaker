@@ -1,8 +1,13 @@
 """Tests for the scan runner's fixed probe plan."""
 
+import io
 from pathlib import Path
 
+from rich.console import Console
+
 from code_breaker.harness import run_target
+from code_breaker.models import ProbeResult
+from code_breaker.report import render_report
 from code_breaker.scan import run_probes
 
 PATCHED_DIR = (Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "patched_target").resolve()
@@ -25,3 +30,19 @@ def test_run_probes_dead_server_is_inconclusive() -> None:
     assert len(results) == 3
     assert all(result.status == "INCONCLUSIVE" for result in results)
     assert all(result.summary == "probe crashed: ConnectError" for result in results)
+
+
+def test_report_title_labels_the_original_target() -> None:
+    stream = io.StringIO()
+    console = Console(file=stream, width=120)
+    results = [
+        ProbeResult(
+            probe="idor",
+            endpoint="/wallets/{wallet_id}",
+            status="FAIL",
+            summary="attacker read another user's wallet with their own token",
+            evidence=[],
+        )
+    ]
+    render_report(results, console=console, title="ORIGINAL target (vulnerable)")
+    assert "ORIGINAL target (vulnerable)" in stream.getvalue()

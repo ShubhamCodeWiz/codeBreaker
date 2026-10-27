@@ -51,11 +51,11 @@ def run_probes(base_url: str) -> list[ProbeResult]:
     return [_guarded(name, endpoint, call) for name, endpoint, call in plan]
 
 
-def _scan(app_dir: str, console=None) -> list[ProbeResult]:
+def _scan(app_dir: str, title: str, console=None) -> list[ProbeResult]:
     """Start a fresh target, run the plan against it, and render its report."""
     with run_target(app_dir=app_dir) as server:
         results = run_probes(str(server))
-    render_report(results, console=console)
+    render_report(results, console=console, title=title)
     return results
 
 
@@ -71,12 +71,12 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if args.target == "original":
-        _scan(".")
+        _scan(".", "ORIGINAL target (vulnerable)")
     elif args.target == "patched":
-        _scan(str(PATCHED_DIR))
+        _scan(str(PATCHED_DIR), "PATCHED target")
     else:
-        before = _scan(".")
-        after = _scan(str(PATCHED_DIR))
+        before = _scan(".", "ORIGINAL target (vulnerable)")
+        after = _scan(str(PATCHED_DIR), "PATCHED target")
         render_comparison(before, after)
 
 
