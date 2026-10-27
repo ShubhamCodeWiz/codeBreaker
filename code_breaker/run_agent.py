@@ -1,10 +1,11 @@
-"""End-to-end CLI: probe the original, let the agent patch IDOR, re-probe, compare."""
+"""End-to-end CLI: probe the original, let the agents patch IDOR and missing auth, compare."""
 
 import argparse
 import json
 import os
 import re
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -20,6 +21,8 @@ from code_breaker.agent import (  # noqa: E402
     AgentDeps,
     RepeatedToolCallError,
     build_agent,
+    build_auth_agent,
+    run_auth_agent,
     run_idor_agent,
 )
 from code_breaker.harness import run_target  # noqa: E402
@@ -30,6 +33,8 @@ from code_breaker.scan import run_probes  # noqa: E402
 DEFAULT_MODEL = "groq:openai/gpt-oss-120b"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ALICE = {"username": "alice", "password": "password1", "wallet_id": "W_A"}
+BOB = {"username": "bob", "password": "password2"}
+PAUSE_SECONDS = 20
 MISSING_KEY_HINT = "copy .env.example to .env and fill in GROQ_API_KEY."
 FAILURE_HINT = "the run stopped here; re-run with --debug for the tool transcript."
 CLIP_CHARS = 300
@@ -113,25 +118,43 @@ def _make_reporter(console: Console):
     return report
 
 
-def _payload(results_before, results_after, outcome) -> dict:
+def _agent_payload(outcome: dict) -> dict:
+    """The stable, JSON-safe keys for one agent's outcome."""
+    payload = {
+        "endpoint_tried": outcome["endpoint_tried"],
+        "final_status": outcome["final_status"],
+        "attempts": outcome["attempts"],
+    }
+    if "probe_statuses" in outcome:
+        payload["probe_statuses"] = outcome["probe_statuses"]
+    return payload
+
+
+def _payload(results_before, results_after, idor_outcome: dict, auth_outcome: dict) -> dict:
     """JSON-safe report of a run; contains no credentials or tokens."""
     return {
         "results_before": [result.model_dump() for result in results_before],
         "results_after": [result.model_dump() for result in results_after],
-        "agent": {
-            "endpoint_tried": outcome["endpoint_tried"],
-            "final_status": outcome["final_status"],
-            "attempts": outcome["attempts"],
-        },
-        "diff": outcome["diff"],
+        "agent": _agent_payload(idor_outcome),
+        "diff": idor_outcome["diff"],
+        "auth_agent": _agent_payload(auth_outcome),
+        "auth_diff": auth_outcome["diff"],
     }
+
+
+def _print_outcome(console: Console, label: str, outcome: dict) -> None:
+    """Print one agent's outcome dict (minus usage and diff) and then its diff."""
+    summary = {key: value for key, value in outcome.items() if key not in {"usage", "diff"}}
+    console.print(Text(f"{label} agent: {summary}"))
+    if outcome["diff"]:
+        console.print(Text(outcome["diff"]))
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run the whole flow and return a process exit code."""
     parser = argparse.ArgumentParser(
         prog="code_breaker.run_agent",
-        description="Probe the original target, let the agent fix IDOR, then compare.",
+        description="Probe the original target, let the agents fix IDOR and missing auth, then compare.",
     )
     parser.add_argument("--save", type=Path, default=None, help="write the run report as JSON here")
     parser.add_argument(
@@ -159,26 +182,28 @@ def main(argv: list[str] | None = None) -> int:
 
         workspace = make_workspace(REPO_ROOT)
         console.print(Text(f"PATCH: agent {model_name} working in {workspace}", style="bold"))
-        agent = build_agent(model_name)
         with run_target(app_dir=str(workspace)) as initial:
             deps = AgentDeps(
                 base_url=str(initial),
                 workspace=workspace,
                 attacker=ALICE,
+                owner=BOB,
                 victim_wallet_id="W_B",
                 report=_make_reporter(console),
             )
-            outcome = run_idor_agent(agent, deps)
-        usage = outcome["usage"]
+            idor_outcome = run_idor_agent(build_agent(model_name), deps)
+        usage = idor_outcome["usage"]
 
-        console.print(
-            Text(
-                f"agent: endpoint tried {outcome['endpoint_tried']} · "
-                f"final status {outcome['final_status']} · attempts {outcome['attempts']}"
-            )
-        )
-        if outcome["diff"]:
-            console.print(Text(outcome["diff"]))
+        _print_outcome(console, "idor", idor_outcome)
+
+        console.print(Text(f"pausing {PAUSE_SECONDS}s to respect free-tier token limits"))
+        time.sleep(PAUSE_SECONDS)
+
+        with run_target(app_dir=str(workspace)) as initial:
+            deps.base_url = str(initial)
+            auth_outcome = run_auth_agent(build_auth_agent(model_name), deps)
+
+        _print_outcome(console, "auth", auth_outcome)
 
         console.print(Text("AFTER: probing the agent-patched workspace", style="bold"))
         with run_target(app_dir=str(workspace)) as server:
@@ -191,7 +216,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.save is not None:
             args.save.parent.mkdir(parents=True, exist_ok=True)
             args.save.write_text(
-                json.dumps(_payload(results_before, results_after, outcome), indent=2),
+                json.dumps(
+                    _payload(results_before, results_after, idor_outcome, auth_outcome),
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
             console.print(Text(f"saved report to {args.save}"))

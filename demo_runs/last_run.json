@@ -1,0 +1,254 @@
+{
+  "results_before": [
+    {
+      "probe": "idor",
+      "endpoint": "/wallets/{wallet_id}",
+      "status": "FAIL",
+      "summary": "attacker read another user's wallet with their own token",
+      "evidence": [
+        {
+          "method": "POST",
+          "path": "/login",
+          "status_code": 200,
+          "note": "attacker login"
+        },
+        {
+          "method": "GET",
+          "path": "/wallets/W_A",
+          "status_code": 200,
+          "note": "control: attacker's own wallet"
+        },
+        {
+          "method": "GET",
+          "path": "/wallets/W_B",
+          "status_code": 200,
+          "note": "attack: victim wallet"
+        }
+      ]
+    },
+    {
+      "probe": "unauthenticated_access",
+      "endpoint": "/wallets/W_B/transactions",
+      "status": "FAIL",
+      "summary": "endpoint reachable without a token",
+      "evidence": [
+        {
+          "method": "POST",
+          "path": "/login",
+          "status_code": 200,
+          "note": "user login"
+        },
+        {
+          "method": "GET",
+          "path": "/wallets/W_B/transactions",
+          "status_code": 200,
+          "note": "control: with token"
+        },
+        {
+          "method": "GET",
+          "path": "/wallets/W_B/transactions",
+          "status_code": 200,
+          "note": "attack: without token"
+        }
+      ]
+    },
+    {
+      "probe": "idor",
+      "endpoint": "/wallets/{wallet_id}/transactions",
+      "status": "FAIL",
+      "summary": "attacker read another user's wallet with their own token",
+      "evidence": [
+        {
+          "method": "POST",
+          "path": "/login",
+          "status_code": 200,
+          "note": "attacker login"
+        },
+        {
+          "method": "GET",
+          "path": "/wallets/W_A/transactions",
+          "status_code": 200,
+          "note": "control: attacker's own wallet"
+        },
+        {
+          "method": "GET",
+          "path": "/wallets/W_B/transactions",
+          "status_code": 200,
+          "note": "attack: victim wallet"
+        }
+      ]
+    },
+    {
+      "probe": "idempotency",
+      "endpoint": "/wallets/W_A/withdraw",
+      "status": "FAIL",
+      "summary": "replayed key debited the balance twice",
+      "evidence": [
+        {
+          "method": "POST",
+          "path": "/login",
+          "status_code": 200,
+          "note": "user login"
+        },
+        {
+          "method": "GET",
+          "path": "/wallets/W_A",
+          "status_code": 200,
+          "note": "balance before: 100"
+        },
+        {
+          "method": "POST",
+          "path": "/wallets/W_A/withdraw",
+          "status_code": 200,
+          "note": "withdraw: first attempt"
+        },
+        {
+          "method": "POST",
+          "path": "/wallets/W_A/withdraw",
+          "status_code": 200,
+          "note": "withdraw: replay with the same key"
+        },
+        {
+          "method": "GET",
+          "path": "/wallets/W_A",
+          "status_code": 200,
+          "note": "balance after: 60"
+        }
+      ]
+    }
+  ],
+  "results_after": [
+    {
+      "probe": "idor",
+      "endpoint": "/wallets/{wallet_id}",
+      "status": "PASS",
+      "summary": "target denied access to another user's wallet",
+      "evidence": [
+        {
+          "method": "POST",
+          "path": "/login",
+          "status_code": 200,
+          "note": "attacker login"
+        },
+        {
+          "method": "GET",
+          "path": "/wallets/W_A",
+          "status_code": 200,
+          "note": "control: attacker's own wallet"
+        },
+        {
+          "method": "GET",
+          "path": "/wallets/W_B",
+          "status_code": 403,
+          "note": "attack: victim wallet"
+        }
+      ]
+    },
+    {
+      "probe": "unauthenticated_access",
+      "endpoint": "/wallets/W_B/transactions",
+      "status": "PASS",
+      "summary": "target rejected the request without a token",
+      "evidence": [
+        {
+          "method": "POST",
+          "path": "/login",
+          "status_code": 200,
+          "note": "user login"
+        },
+        {
+          "method": "GET",
+          "path": "/wallets/W_B/transactions",
+          "status_code": 200,
+          "note": "control: with token"
+        },
+        {
+          "method": "GET",
+          "path": "/wallets/W_B/transactions",
+          "status_code": 401,
+          "note": "attack: without token"
+        }
+      ]
+    },
+    {
+      "probe": "idor",
+      "endpoint": "/wallets/{wallet_id}/transactions",
+      "status": "PASS",
+      "summary": "target denied access to another user's wallet",
+      "evidence": [
+        {
+          "method": "POST",
+          "path": "/login",
+          "status_code": 200,
+          "note": "attacker login"
+        },
+        {
+          "method": "GET",
+          "path": "/wallets/W_A/transactions",
+          "status_code": 200,
+          "note": "control: attacker's own wallet"
+        },
+        {
+          "method": "GET",
+          "path": "/wallets/W_B/transactions",
+          "status_code": 403,
+          "note": "attack: victim wallet"
+        }
+      ]
+    },
+    {
+      "probe": "idempotency",
+      "endpoint": "/wallets/W_A/withdraw",
+      "status": "FAIL",
+      "summary": "replayed key debited the balance twice",
+      "evidence": [
+        {
+          "method": "POST",
+          "path": "/login",
+          "status_code": 200,
+          "note": "user login"
+        },
+        {
+          "method": "GET",
+          "path": "/wallets/W_A",
+          "status_code": 200,
+          "note": "balance before: 100"
+        },
+        {
+          "method": "POST",
+          "path": "/wallets/W_A/withdraw",
+          "status_code": 200,
+          "note": "withdraw: first attempt"
+        },
+        {
+          "method": "POST",
+          "path": "/wallets/W_A/withdraw",
+          "status_code": 200,
+          "note": "withdraw: replay with the same key"
+        },
+        {
+          "method": "GET",
+          "path": "/wallets/W_A",
+          "status_code": 200,
+          "note": "balance after: 60"
+        }
+      ]
+    }
+  ],
+  "agent": {
+    "endpoint_tried": "/wallets/{wallet_id}",
+    "final_status": "PASS",
+    "attempts": 1
+  },
+  "diff": "--- target_app/main.py\n+++ target_app/main.py\n@@ -64,6 +64,8 @@\n     # VULN: IDOR - no ownership check\n     for owner, user in USERS.items():\n         if user[\"wallet\"] == wallet_id:\n+            if owner != username:\n+                raise HTTPException(status_code=403, detail=\"Wallet does not belong to you\")\n             return {\"wallet_id\": wallet_id, \"owner\": owner, \"balance\": user[\"balance\"]}\n     raise HTTPException(status_code=404, detail=\"Wallet not found\")\n \n",
+  "auth_agent": {
+    "endpoint_tried": "/wallets/{wallet_id}/transactions",
+    "final_status": "PASS",
+    "attempts": 1,
+    "probe_statuses": {
+      "unauthenticated_access": "PASS",
+      "idor_transactions": "PASS"
+    }
+  },
+  "auth_diff": "--- target_app/main.py\n+++ target_app/main.py\n@@ -70,12 +70,18 @@\n     raise HTTPException(status_code=404, detail=\"Wallet not found\")\n \n \n-# VULN: missing auth - no token required\n+# Authenticated and ownership-checked endpoint for wallet transactions\n @app.get(\"/wallets/{wallet_id}/transactions\")\n-def read_transactions(wallet_id: str) -> dict[str, str | list[dict[str, str | int]]]:\n-    \"\"\"Return a wallet's transactions. Intentionally unauthenticated: no ownership or token check.\"\"\"\n+def read_transactions(\n+    wallet_id: str,\n+    username: Annotated[str, Depends(get_current_user)],\n+) -> dict[str, str | list[dict[str, str | int]]]:\n+    \"\"\"Return a wallet's transactions. Authenticated and ownership-checked.\"\"\"\n     if wallet_id not in TRANSACTIONS:\n         raise HTTPException(status_code=404, detail=\"Wallet not found\")\n+    user = USERS[username]\n+    if user[\"wallet\"] != wallet_id:\n+        raise HTTPException(status_code=403, detail=\"Wallet does not belong to you\")\n     return {\"wallet_id\": wallet_id, \"transactions\": TRANSACTIONS[wallet_id]}\n \n \n"
+}

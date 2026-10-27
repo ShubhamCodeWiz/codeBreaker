@@ -22,6 +22,8 @@ from code_breaker.agent import (  # noqa: E402
     AgentDeps,
     RepeatedToolCallError,
     build_agent,
+    build_auth_agent,
+    run_auth_agent,
     run_idor_agent,
 )
 from code_breaker.harness import run_target  # noqa: E402
@@ -30,6 +32,8 @@ from code_breaker.patch import cleanup_workspace, make_workspace, read_file  # n
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MAIN = "target_app/main.py"
 ALICE = {"username": "alice", "password": "password1", "wallet_id": "W_A"}
+BOB = {"username": "bob", "password": "password2"}
+AUTH_TEMPLATE = "/wallets/{wallet_id}/transactions"
 
 IDOR_OLD = """    # VULN: IDOR - no ownership check
     for owner, user in USERS.items():
@@ -44,6 +48,63 @@ IDOR_NEW = """    # FIXED: ownership check
                 raise HTTPException(status_code=403, detail="Wallet does not belong to you")
             return {"wallet_id": wallet_id, "owner": owner, "balance": user["balance"]}
 """
+
+AUTH_OLD = '''# VULN: missing auth - no token required
+@app.get("/wallets/{wallet_id}/transactions")
+def read_transactions(wallet_id: str) -> dict[str, str | list[dict[str, str | int]]]:
+    """Return a wallet's transactions. Intentionally unauthenticated: no ownership or token check."""
+    if wallet_id not in TRANSACTIONS:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    return {"wallet_id": wallet_id, "transactions": TRANSACTIONS[wallet_id]}
+'''
+
+# First attempt: the token requirement alone. The wallet still belongs to
+# someone else, so the IDOR probe on this same route must still FAIL.
+AUTH_ONLY_NEW = '''# PARTIAL: token required, ownership still unchecked
+@app.get("/wallets/{wallet_id}/transactions")
+def read_transactions(
+    wallet_id: str,
+    username: Annotated[str, Depends(get_current_user)],
+) -> dict[str, str | list[dict[str, str | int]]]:
+    """Return a wallet's transactions to any authenticated caller."""
+    if wallet_id not in TRANSACTIONS:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    return {"wallet_id": wallet_id, "transactions": TRANSACTIONS[wallet_id]}
+'''
+
+AUTH_ONLY_OLD = '''    """Return a wallet's transactions to any authenticated caller."""
+    if wallet_id not in TRANSACTIONS:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    return {"wallet_id": wallet_id, "transactions": TRANSACTIONS[wallet_id]}
+'''
+
+AUTH_OWNERSHIP_NEW = '''    """Return a wallet's transactions to its owner only."""
+    if wallet_id not in TRANSACTIONS:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    for owner, user in USERS.items():
+        if user["wallet"] == wallet_id:
+            if owner != username:
+                raise HTTPException(status_code=403, detail="Wallet does not belong to you")
+            break
+    return {"wallet_id": wallet_id, "transactions": TRANSACTIONS[wallet_id]}
+'''
+
+AUTH_NEW = '''# FIXED: auth + ownership check
+@app.get("/wallets/{wallet_id}/transactions")
+def read_transactions(
+    wallet_id: str,
+    username: Annotated[str, Depends(get_current_user)],
+) -> dict[str, str | list[dict[str, str | int]]]:
+    """Return a wallet's transactions to its owner only."""
+    if wallet_id not in TRANSACTIONS:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    for owner, user in USERS.items():
+        if user["wallet"] == wallet_id:
+            if owner != username:
+                raise HTTPException(status_code=403, detail="Wallet does not belong to you")
+            break
+    return {"wallet_id": wallet_id, "transactions": TRANSACTIONS[wallet_id]}
+'''
 
 
 def _calls_this_turn(messages) -> int:
@@ -70,8 +131,59 @@ def scripted_model(steps: list[tuple[str, dict]]):
     return FunctionModel(script)
 
 
+def scripted_turns(turns: list[list[tuple[str, dict]]]):
+    """Return a FunctionModel that plays one script per run_sync turn."""
+
+    def script(messages, info) -> ModelResponse:
+        turn = (
+            sum(
+                isinstance(part, UserPromptPart)
+                for message in messages
+                for part in getattr(message, "parts", [])
+            )
+            - 1
+        )
+        steps = turns[turn] if 0 <= turn < len(turns) else []
+        index = _calls_this_turn(messages)
+        if index < len(steps):
+            name, args = steps[index]
+            return ModelResponse(parts=[ToolCallPart(name, args)])
+        return ModelResponse(parts=[TextPart("reporting the final probe statuses")])
+
+    return FunctionModel(script)
+
+
+def _last_user_prompt(messages) -> str:
+    """The text of the most recent user prompt in a run history."""
+    for message in reversed(messages):
+        for part in reversed(getattr(message, "parts", [])):
+            if isinstance(part, UserPromptPart):
+                return str(part.content)
+    return ""
+
+
+def scripted_by_prompt(scripts: dict[str, list[tuple[str, dict]]]):
+    """Return a FunctionModel that picks its script from the latest user prompt."""
+
+    def script(messages, info) -> ModelResponse:
+        steps = scripts.get(_last_user_prompt(messages), [])
+        index = _calls_this_turn(messages)
+        if index < len(steps):
+            name, args = steps[index]
+            return ModelResponse(parts=[ToolCallPart(name, args)])
+        return ModelResponse(parts=[TextPart("reporting the final probe statuses")])
+
+    return FunctionModel(script)
+
+
 def _deps(server: str, workspace: Path) -> AgentDeps:
-    return AgentDeps(base_url=server, workspace=workspace, attacker=ALICE, victim_wallet_id="W_B")
+    return AgentDeps(
+        base_url=server,
+        workspace=workspace,
+        attacker=ALICE,
+        owner=BOB,
+        victim_wallet_id="W_B",
+    )
 
 
 def test_agent_happy_path() -> None:
@@ -137,6 +249,115 @@ def test_no_probe_call_reports_not_run_without_crashing() -> None:
 
     assert outcome["final_status"] == "NOT_RUN"
     assert outcome["endpoint_tried"] is None
+    assert outcome["attempts"] == 0
+
+
+AUTH_STEPS = [
+    ("list_target_endpoints", {}),
+    ("run_unauth_probe", {"path_template": AUTH_TEMPLATE}),
+    ("run_idor_probe", {"path_template": AUTH_TEMPLATE}),
+    ("list_target_files", {}),
+    ("read_target_file", {"rel_path": MAIN}),
+    ("apply_patch", {"rel_path": MAIN, "old": AUTH_OLD, "new": AUTH_NEW}),
+    ("run_unauth_probe", {"path_template": AUTH_TEMPLATE}),
+    ("run_idor_probe", {"path_template": AUTH_TEMPLATE}),
+]
+
+
+def test_run_unauth_probe_tool_is_recorded() -> None:
+    workspace = make_workspace(REPO_ROOT)
+    try:
+        with run_target(app_dir=str(workspace)) as server:
+            steps = [("run_unauth_probe", {"path_template": AUTH_TEMPLATE})]
+            deps = _deps(str(server), workspace)
+            run_auth_agent(build_auth_agent(scripted_model(steps)), deps)
+    finally:
+        cleanup_workspace(workspace)
+
+    entry = deps.transcript[0]
+    assert entry["tool"] == "run_unauth_probe"
+    assert entry["args"] == {"path_template": AUTH_TEMPLATE}
+    assert entry["result"]["probe"] == "unauthenticated_access"
+    assert entry["result"]["endpoint"] == "/wallets/W_B/transactions"
+    assert entry["result"]["status"] == "FAIL"
+
+
+def test_auth_agent_happy_path() -> None:
+    workspace = make_workspace(REPO_ROOT)
+    try:
+        with run_target(app_dir=str(workspace)) as server:
+            deps = _deps(str(server), workspace)
+            outcome = run_auth_agent(build_auth_agent(scripted_model(AUTH_STEPS)), deps)
+    finally:
+        cleanup_workspace(workspace)
+
+    assert outcome["endpoint_tried"] == AUTH_TEMPLATE
+    assert outcome["attempts"] == 1
+    assert outcome["final_status"] == "PASS"
+    assert outcome["probe_statuses"] == {
+        "unauthenticated_access": "PASS",
+        "idor_transactions": "PASS",
+    }
+    assert outcome["diff"]
+
+
+def test_auth_agent_rejects_an_auth_only_fix_and_retries() -> None:
+    """A token check alone leaves the IDOR open, so the second edit must add ownership."""
+    first_turn = [
+        ("list_target_endpoints", {}),
+        ("run_unauth_probe", {"path_template": AUTH_TEMPLATE}),
+        ("run_idor_probe", {"path_template": AUTH_TEMPLATE}),
+        ("read_target_file", {"rel_path": MAIN}),
+        ("apply_patch", {"rel_path": MAIN, "old": AUTH_OLD, "new": AUTH_ONLY_NEW}),
+        ("run_unauth_probe", {"path_template": AUTH_TEMPLATE}),
+        ("run_idor_probe", {"path_template": AUTH_TEMPLATE}),
+    ]
+    second_turn = [
+        ("read_target_file", {"rel_path": MAIN}),
+        ("apply_patch", {"rel_path": MAIN, "old": AUTH_ONLY_OLD, "new": AUTH_OWNERSHIP_NEW}),
+        ("run_unauth_probe", {"path_template": AUTH_TEMPLATE}),
+        ("run_idor_probe", {"path_template": AUTH_TEMPLATE}),
+    ]
+    workspace = make_workspace(REPO_ROOT)
+    try:
+        with run_target(app_dir=str(workspace)) as server:
+            deps = _deps(str(server), workspace)
+            agent = build_auth_agent(scripted_turns([first_turn, second_turn]))
+            outcome = run_auth_agent(agent, deps)
+    finally:
+        cleanup_workspace(workspace)
+
+    probes = [
+        (entry["tool"], entry["result"]["status"])
+        for entry in deps.transcript
+        if entry["tool"] in {"run_unauth_probe", "run_idor_probe"}
+    ]
+    # After the auth-only edit the token requirement passes, ownership does not.
+    assert probes[2] == ("run_unauth_probe", "PASS")
+    assert probes[3] == ("run_idor_probe", "FAIL")
+    assert outcome["attempts"] == 2
+    assert outcome["final_status"] == "PASS"
+    assert outcome["probe_statuses"] == {
+        "unauthenticated_access": "PASS",
+        "idor_transactions": "PASS",
+    }
+
+
+def test_auth_agent_without_probes_reports_not_run() -> None:
+    workspace = make_workspace(REPO_ROOT)
+    try:
+        with run_target(app_dir=str(workspace)) as server:
+            steps = [("list_target_files", {}), ("read_target_file", {"rel_path": MAIN})]
+            agent = build_auth_agent(scripted_model(steps))
+            outcome = run_auth_agent(agent, _deps(str(server), workspace))
+    finally:
+        cleanup_workspace(workspace)
+
+    assert outcome["final_status"] == "NOT_RUN"
+    assert outcome["probe_statuses"] == {
+        "unauthenticated_access": None,
+        "idor_transactions": None,
+    }
     assert outcome["attempts"] == 0
 
 
