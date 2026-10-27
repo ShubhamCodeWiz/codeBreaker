@@ -7,7 +7,13 @@ from pydantic_ai.exceptions import ModelHTTPError
 
 from code_breaker import run_agent
 from code_breaker.agent import build_agent
-from tests.test_agent import IDOR_NEW, IDOR_OLD, MAIN, scripted_model
+from tests.test_agent import (
+    IDOR_NEW,
+    IDOR_OLD,
+    MAIN,
+    _repeating_model,
+    scripted_model,
+)
 
 STEPS = [
     ("list_target_endpoints", {}),
@@ -147,3 +153,57 @@ def test_debug_prints_transcript_with_truncated_args(monkeypatch, capsys) -> Non
     assert "z" * 50 in output
     assert LONG_OLD not in output
     assert "…" in output
+
+
+def test_live_progress_lines_appear_in_order(monkeypatch, capsys) -> None:
+    _fake_environment(monkeypatch)
+
+    code = run_agent.main([])
+    output = capsys.readouterr().out
+    lines = [line for line in output.splitlines() if line.startswith("tool ")]
+
+    assert code == 0
+    assert lines[0].startswith("tool 1: list_target_endpoints")
+    assert lines[1].startswith("tool 2: run_idor_probe")
+    assert lines[2].startswith("tool 3: read_target_file")
+    assert lines[3].startswith("tool 4: apply_patch")
+    assert lines[4].startswith("tool 5: run_idor_probe")
+    assert "-> ok" in lines[0]
+    assert "-> FAIL" in lines[1]
+    assert "-> PASS" in lines[4]
+
+
+def test_repeat_guard_stops_the_cli_and_prints_transcript(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(run_agent, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setenv("GROQ_API_KEY", DUMMY_KEY)
+    monkeypatch.setenv("COLUMNS", "200")
+    monkeypatch.setattr(
+        run_agent,
+        "build_agent",
+        lambda model: build_agent(_repeating_model("read_target_file", {"rel_path": "../main.py"})),
+    )
+
+    code = run_agent.main([])
+    output = capsys.readouterr().out
+
+    assert code == 1
+    assert "stopped: model repeated the same call 3 times" in output
+    assert "--- transcript ---" in output
+    assert "tool: read_target_file" in output
+
+
+def test_keyboard_interrupt_prints_transcript(monkeypatch, capsys) -> None:
+    _fake_environment(monkeypatch)
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("code_breaker.agent.patch.read_file", interrupt)
+
+    code = run_agent.main([])
+    output = capsys.readouterr().out
+
+    assert code == 130
+    assert "interrupted" in output
+    assert "--- transcript ---" in output
+    assert "tool: run_idor_probe" in output

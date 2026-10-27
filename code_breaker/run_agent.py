@@ -9,10 +9,16 @@ import traceback
 from pathlib import Path
 
 from dotenv import load_dotenv
+from pydantic_ai.exceptions import UsageLimitExceeded
 from rich.console import Console
 from rich.text import Text
 
-from code_breaker.agent import AgentDeps, build_agent, run_idor_agent
+from code_breaker.agent import (
+    AgentDeps,
+    RepeatedToolCallError,
+    build_agent,
+    run_idor_agent,
+)
 from code_breaker.harness import run_target
 from code_breaker.patch import cleanup_workspace, make_workspace
 from code_breaker.report import render_comparison, render_report
@@ -24,6 +30,7 @@ ALICE = {"username": "alice", "password": "password1", "wallet_id": "W_A"}
 MISSING_KEY_HINT = "copy .env.example to .env and fill in GROQ_API_KEY."
 FAILURE_HINT = "the run stopped here; re-run with --debug for the tool transcript."
 CLIP_CHARS = 300
+TRANSCRIPT_ARG_CHARS = 120
 
 REDACTIONS = (
     re.compile(r"Bearer[ \t]+\S+", re.IGNORECASE),
@@ -90,6 +97,19 @@ def _render_transcript(deps: AgentDeps | None, usage: dict | None, console: Cons
     console.print(Text(f"usage: {usage if usage else 'unavailable'}"))
 
 
+def _make_reporter(console: Console):
+    """Stream one scrubbed line per tool call, as it happens."""
+
+    def report(entry: dict) -> None:
+        line = (
+            f"tool {entry['index']}: {entry['tool']} "
+            f"{_clip(entry['args'], TRANSCRIPT_ARG_CHARS)} -> {entry['outcome']}"
+        )
+        console.print(Text(line))
+
+    return report
+
+
 def _payload(results_before, results_after, outcome) -> dict:
     """JSON-safe report of a run; contains no credentials or tokens."""
     return {
@@ -143,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
                 workspace=workspace,
                 attacker=ALICE,
                 victim_wallet_id="W_B",
+                report=_make_reporter(console),
             )
             outcome = run_idor_agent(agent, deps)
         usage = outcome["usage"]
@@ -174,6 +195,20 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.debug:
             _render_transcript(deps, usage, console)
+    except KeyboardInterrupt:
+        console.print(Text("stopped: interrupted - transcript so far", style="red"))
+        _render_transcript(deps, usage, console)
+        return 130
+    except RepeatedToolCallError as error:
+        console.print(
+            Text(f"stopped: model repeated the same call {error.count} times", style="red")
+        )
+        _render_transcript(deps, usage, console)
+        return 1
+    except UsageLimitExceeded:
+        console.print(Text("stopped: model request limit reached", style="red"))
+        _render_transcript(deps, usage, console)
+        return 1
     except Exception as error:  # noqa: BLE001 - diagnose without ever printing the message
         console.print(Text(_describe_error(error, model_name), style="red"))
         if args.debug:

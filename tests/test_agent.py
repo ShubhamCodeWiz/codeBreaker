@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 import pytest
+from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (
     ModelResponse,
     TextPart,
@@ -16,7 +17,12 @@ from pydantic_ai.models.function import FunctionModel
 
 os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
 
-from code_breaker.agent import AgentDeps, build_agent, run_idor_agent  # noqa: E402
+from code_breaker.agent import (  # noqa: E402
+    AgentDeps,
+    RepeatedToolCallError,
+    build_agent,
+    run_idor_agent,
+)
 from code_breaker.harness import run_target  # noqa: E402
 from code_breaker.patch import cleanup_workspace, make_workspace, read_file  # noqa: E402
 
@@ -188,3 +194,79 @@ def test_apply_patch_bad_path_is_reported_to_the_model() -> None:
     assert "escapes" in rejected["result"]["message"]
     assert accepted["result"]["ok"] is True
     assert "403" in accepted["result"]["diff"]
+
+
+def _repeating_model(tool: str, args: dict) -> FunctionModel:
+    """A model that keeps issuing the exact same tool call forever."""
+
+    def script(messages, info) -> ModelResponse:
+        return ModelResponse(parts=[ToolCallPart(tool, args)])
+
+    return FunctionModel(script)
+
+
+def _endless_distinct_model() -> FunctionModel:
+    """A model that issues a different (never-repeating) call every time."""
+
+    def script(messages, info) -> ModelResponse:
+        used = sum(
+            1
+            for message in messages
+            for part in getattr(message, "parts", [])
+            if isinstance(part, ToolCallPart)
+        )
+        return ModelResponse(parts=[ToolCallPart("read_target_file", {"rel_path": f"missing{used}.py"})])
+
+    return FunctionModel(script)
+
+
+def test_repeat_guard_stops_an_identical_call_after_three_tries() -> None:
+    workspace = make_workspace(REPO_ROOT)
+    try:
+        with run_target(app_dir=str(workspace)) as server:
+            agent = build_agent(_repeating_model("read_target_file", {"rel_path": "../main.py"}))
+            deps = _deps(str(server), workspace)
+            with pytest.raises(RepeatedToolCallError) as caught:
+                run_idor_agent(agent, deps)
+    finally:
+        cleanup_workspace(workspace)
+
+    assert "repeated the same call 3 times" in str(caught.value)
+    identical = [entry for entry in deps.transcript if entry["tool"] == "read_target_file"]
+    assert len(identical) == 3
+
+
+def test_request_limit_stops_endless_distinct_calls() -> None:
+    workspace = make_workspace(REPO_ROOT)
+    try:
+        with run_target(app_dir=str(workspace)) as server:
+            agent = build_agent(_endless_distinct_model())
+            deps = _deps(str(server), workspace)
+            with pytest.raises(UsageLimitExceeded):
+                run_idor_agent(agent, deps)
+    finally:
+        cleanup_workspace(workspace)
+
+    assert len(deps.transcript) > 1
+
+
+def test_keyboard_interrupt_escapes_a_tool_call(monkeypatch) -> None:
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("code_breaker.agent.patch.read_file", interrupt)
+    workspace = make_workspace(REPO_ROOT)
+    try:
+        with run_target(app_dir=str(workspace)) as server:
+            steps = [
+                ("list_target_endpoints", {}),
+                ("read_target_file", {"rel_path": MAIN}),
+            ]
+            agent = build_agent(scripted_model(steps))
+            deps = _deps(str(server), workspace)
+            with pytest.raises(KeyboardInterrupt):
+                run_idor_agent(agent, deps)
+    finally:
+        cleanup_workspace(workspace)
+
+    assert [entry["tool"] for entry in deps.transcript] == ["list_target_endpoints"]

@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ToolCallPart, ToolReturnPart
+from pydantic_ai.usage import UsageLimits
 
 from code_breaker import patch
 from code_breaker.harness import run_target
@@ -28,7 +29,9 @@ Work only through your tools:
 5. Re-run run_idor_probe against the same path template to verify the fix.
 
 Tools return an object with "error" when they fail. Read it and correct your
-next call instead of repeating the same arguments.
+next call instead of repeating the same arguments. Repeating one identical
+call is a hard error: never send the same tool call twice without changing
+the arguments.
 
 If the probe still does not pass, read the file again and try a different
 exact edit, within the attempt limit you are given. Never claim the bug is
@@ -39,6 +42,17 @@ USER_PROMPT = "Find the wallet-read endpoint, confirm the IDOR bug, fix it, and 
 
 MAX_RECORDED_CHARS = 2000
 TOOL_FAILURE_TEXT = "tool failed; check the arguments and try again"
+REPEAT_LIMIT = 3
+REQUEST_LIMIT = 10
+
+
+class RepeatedToolCallError(RuntimeError):
+    """Raised when the model repeats one identical tool call too many times in a run."""
+
+    def __init__(self, tool: str, count: int) -> None:
+        super().__init__(f"stopped: model repeated the same call {count} times")
+        self.tool = tool
+        self.count = count
 
 
 @dataclass
@@ -53,20 +67,58 @@ class AgentDeps:
     # because a running server keeps the module it imported at startup.
     restart: Callable[[], None] | None = field(default=None, repr=False)
     # One entry per tool call: {"tool": ..., "args": ..., "result": ...}.
-    transcript: list[dict[str, object]] = field(default_factory=list)
+    transcript: list[dict] = field(default_factory=list)
+    # Called the moment a tool finishes, so the CLI can stream live progress.
+    report: Callable[[dict], None] | None = field(default=None, repr=False)
+    # Index in the transcript where the current run_sync started; the repeat guard
+    # only looks at calls made inside the current run.
+    turn_start: int = field(default=0, repr=False)
 
 
-def _record(deps: AgentDeps, tool: str, args: dict, result: object) -> None:
-    """Append one tool call to the transcript the CLI can dump in --debug mode."""
-    if isinstance(result, str) and len(result) > MAX_RECORDED_CHARS:
-        result = result[:MAX_RECORDED_CHARS]
-    deps.transcript.append({"tool": tool, "args": args, "result": result})
+def _outcome(result: object) -> str:
+    """A short label for the progress line: ok, the probe status, or the error class."""
+    if isinstance(result, dict):
+        if result.get("error"):
+            return f"error {result['error']}"
+        if result.get("ok") is False:
+            return "error"
+        if result.get("ok") is True:
+            return "ok"
+        if "status" in result:
+            return str(result["status"])
+    return "ok"
+
+
+def _finish(deps: AgentDeps, tool: str, args: dict, result: object) -> None:
+    """Record, announce and guard one tool call; raise if the model repeats itself."""
+    stored = result
+    if isinstance(stored, str) and len(stored) > MAX_RECORDED_CHARS:
+        stored = stored[:MAX_RECORDED_CHARS]
+    deps.transcript.append({"tool": tool, "args": args, "result": stored})
+
+    if deps.report is not None:
+        deps.report(
+            {
+                "index": len(deps.transcript),
+                "tool": tool,
+                "args": args,
+                "outcome": _outcome(result),
+            }
+        )
+
+    identical = sum(
+        1
+        for entry in deps.transcript[deps.turn_start :]
+        if entry["tool"] == tool and entry["args"] == args
+    )
+    if identical >= REPEAT_LIMIT:
+        raise RepeatedToolCallError(tool, identical)
 
 
 def _failure(deps: AgentDeps, tool: str, args: dict, error: BaseException) -> dict:
     """Build a fixed-text error result: class name only, never the raw message."""
     result = {"ok": False, "error": type(error).__name__, "message": TOOL_FAILURE_TEXT}
-    _record(deps, tool, args, result)
+    _finish(deps, tool, args, result)
     return result
 
 
@@ -82,10 +134,11 @@ def build_agent(model=None) -> Agent[AgentDeps, str]:
     @agent.tool
     def list_target_endpoints(ctx: RunContext[AgentDeps]) -> list[dict] | dict:
         """List the target's endpoints with their method, path and auth requirement."""
+        args: dict = {}
         try:
             schema = httpx.get(f"{ctx.deps.base_url}/openapi.json", timeout=5).json()
         except (httpx.HTTPError, ValueError) as error:
-            return _failure(ctx.deps, "list_target_endpoints", {}, error)
+            return _failure(ctx.deps, "list_target_endpoints", args, error)
 
         endpoints = []
         for path, operations in schema.get("paths", {}).items():
@@ -99,7 +152,7 @@ def build_agent(model=None) -> Agent[AgentDeps, str]:
                         "requires_auth": bool(operation.get("security")),
                     }
                 )
-        _record(ctx.deps, "list_target_endpoints", {}, endpoints)
+        _finish(ctx.deps, "list_target_endpoints", args, endpoints)
         return endpoints
 
     @agent.tool
@@ -117,7 +170,7 @@ def build_agent(model=None) -> Agent[AgentDeps, str]:
             return _failure(ctx.deps, "run_idor_probe", args, error)
 
         payload = result.model_dump()
-        _record(ctx.deps, "run_idor_probe", args, payload)
+        _finish(ctx.deps, "run_idor_probe", args, payload)
         return payload
 
     @agent.tool
@@ -129,7 +182,7 @@ def build_agent(model=None) -> Agent[AgentDeps, str]:
         except (ValueError, OSError, httpx.HTTPError) as error:
             return _failure(ctx.deps, "read_target_file", args, error)
 
-        _record(ctx.deps, "read_target_file", args, text)
+        _finish(ctx.deps, "read_target_file", args, text)
         return text
 
     @agent.tool
@@ -144,19 +197,23 @@ def build_agent(model=None) -> Agent[AgentDeps, str]:
         if result.ok and ctx.deps.restart is not None:
             ctx.deps.restart()
         payload = {"ok": result.ok, "message": result.message, "diff": result.diff}
-        _record(ctx.deps, "apply_patch", args, payload)
+        _finish(ctx.deps, "apply_patch", args, payload)
         return payload
 
     return agent
 
 
-def run_idor_agent(agent: Agent[AgentDeps, str], deps: AgentDeps, max_attempts: int = 3) -> dict:
+def run_idor_agent(
+    agent: Agent[AgentDeps, str],
+    deps: AgentDeps,
+    max_attempts: int = 3,
+    request_limit: int = REQUEST_LIMIT,
+) -> dict:
     """Run the agent until the IDOR probe passes or max_attempts patches are spent.
 
-    The return values come from the tool traffic, not from the model's prose:
-    endpoint_tried is the last run_idor_probe path template, attempts counts
-    apply_patch calls, final_status is the last run_idor_probe status, diff is
-    the last non-empty apply_patch diff, and usage is the last run's token use.
+    Each run_sync call carries a hard UsageLimits request cap, and the tools
+    refuse an identical third call, so neither the model nor the loop can spin.
+    The return values come from the tool traffic, not from the model's prose.
     """
     endpoint_tried: str | None = None
     final_status = "INCONCLUSIVE"
@@ -175,7 +232,13 @@ def run_idor_agent(agent: Agent[AgentDeps, str], deps: AgentDeps, max_attempts: 
 
         while attempts < max_attempts and final_status != "PASS":
             patches_before = attempts
-            result = agent.run_sync(USER_PROMPT, deps=deps, message_history=history)
+            deps.turn_start = len(deps.transcript)
+            result = agent.run_sync(
+                USER_PROMPT,
+                deps=deps,
+                message_history=history,
+                usage_limits=UsageLimits(request_limit=request_limit),
+            )
             history = result.all_messages()
 
             run_usage = getattr(result, "usage", None)
