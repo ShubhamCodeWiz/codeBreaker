@@ -38,13 +38,25 @@ def _guarded(
 
 def run_probes(base_url: str) -> list[ProbeResult]:
     """Run the fixed probe plan against an already running target."""
-    # Fixed plan. In Milestone 4 the agent decides this from /openapi.json instead.
+    # Fixed plan, in this order: the wallet IDOR, the same IDOR on the
+    # transactions route, the missing token requirement on that route, then
+    # idempotency. The two IDOR rows stay distinguishable by their endpoint.
     plan = [
         ("idor", "/wallets/{wallet_id}", lambda: idor_probe(base_url, {**ALICE, "wallet_id": "W_A"}, "W_B")),
         (
             "unauthenticated_access",
             "/wallets/W_B/transactions",
             lambda: unauthenticated_access_probe(base_url, BOB, "/wallets/W_B/transactions"),
+        ),
+        (
+            "idor",
+            "/wallets/{wallet_id}/transactions",
+            lambda: idor_probe(
+                base_url,
+                {**ALICE, "wallet_id": "W_A"},
+                "W_B",
+                path_template="/wallets/{wallet_id}/transactions",
+            ),
         ),
         ("idempotency", "/wallets/W_A/withdraw", lambda: idempotency_probe(base_url, ALICE, "W_A", amount=20)),
     ]

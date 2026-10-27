@@ -16,18 +16,24 @@ PATCHED_DIR = (Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "pat
 def test_run_probes_all_fail_on_original() -> None:
     with run_target() as server:
         results = run_probes(str(server))
-    assert [result.status for result in results] == ["FAIL", "FAIL", "FAIL"]
+    assert [result.status for result in results] == ["FAIL", "FAIL", "FAIL", "FAIL"]
+    assert [(result.probe, result.endpoint) for result in results] == [
+        ("idor", "/wallets/{wallet_id}"),
+        ("unauthenticated_access", "/wallets/W_B/transactions"),
+        ("idor", "/wallets/{wallet_id}/transactions"),
+        ("idempotency", "/wallets/W_A/withdraw"),
+    ]
 
 
 def test_run_probes_all_pass_on_patched() -> None:
     with run_target(app_dir=str(PATCHED_DIR)) as server:
         results = run_probes(str(server))
-    assert [result.status for result in results] == ["PASS", "PASS", "PASS"]
+    assert [result.status for result in results] == ["PASS", "PASS", "PASS", "PASS"]
 
 
 def test_run_probes_dead_server_is_inconclusive() -> None:
     results = run_probes("http://127.0.0.1:1")
-    assert len(results) == 3
+    assert len(results) == 4
     assert all(result.status == "INCONCLUSIVE" for result in results)
     assert all(result.summary == "probe crashed: ConnectError" for result in results)
 

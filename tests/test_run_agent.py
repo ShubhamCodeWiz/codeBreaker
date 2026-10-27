@@ -6,12 +6,21 @@ import pytest
 from pydantic_ai.exceptions import ModelHTTPError
 
 from code_breaker import run_agent
-from code_breaker.agent import build_agent
+from code_breaker.agent import (
+    AUTH_USER_PROMPT,
+    USER_PROMPT,
+    build_agent,
+    build_auth_agent,
+)
 from tests.test_agent import (
+    AUTH_NEW,
+    AUTH_OLD,
+    AUTH_TEMPLATE,
     IDOR_NEW,
     IDOR_OLD,
     MAIN,
     _repeating_model,
+    scripted_by_prompt,
     scripted_model,
 )
 
@@ -23,6 +32,17 @@ STEPS = [
     ("run_idor_probe", {"path_template": "/wallets/{wallet_id}"}),
 ]
 
+AUTH_STEPS = [
+    ("list_target_endpoints", {}),
+    ("run_unauth_probe", {"path_template": AUTH_TEMPLATE}),
+    ("run_idor_probe", {"path_template": AUTH_TEMPLATE}),
+    ("list_target_files", {}),
+    ("read_target_file", {"rel_path": MAIN}),
+    ("apply_patch", {"rel_path": MAIN, "old": AUTH_OLD, "new": AUTH_NEW}),
+    ("run_unauth_probe", {"path_template": AUTH_TEMPLATE}),
+    ("run_idor_probe", {"path_template": AUTH_TEMPLATE}),
+]
+
 DUMMY_KEY = "gsk_dummy_secret_value_000111222333"
 
 
@@ -30,8 +50,11 @@ def _fake_environment(monkeypatch) -> None:
     monkeypatch.setattr(run_agent, "load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.setenv("GROQ_API_KEY", DUMMY_KEY)
     monkeypatch.setenv("COLUMNS", "200")
+    monkeypatch.setattr(run_agent.time, "sleep", lambda seconds: None)
+    function_model = scripted_by_prompt({USER_PROMPT: STEPS, AUTH_USER_PROMPT: AUTH_STEPS})
+    monkeypatch.setattr(run_agent, "build_agent", lambda model_name: build_agent(function_model))
     monkeypatch.setattr(
-        run_agent, "build_agent", lambda model: build_agent(scripted_model(STEPS))
+        run_agent, "build_auth_agent", lambda model_name: build_auth_agent(function_model)
     )
 
 
@@ -60,14 +83,32 @@ def test_run_agent_full_flow_with_function_model(tmp_path, monkeypatch, capsys) 
     assert "STILL VULNERABLE" in output
 
     payload = json.loads(save.read_text(encoding="utf-8"))
-    assert [result["status"] for result in payload["results_before"]] == ["FAIL", "FAIL", "FAIL"]
-    after = {result["probe"]: result["status"] for result in payload["results_after"]}
-    assert after["idor"] == "PASS"
-    assert after["unauthenticated_access"] == "FAIL"
-    assert after["idempotency"] == "FAIL"
+    assert [result["status"] for result in payload["results_before"]] == [
+        "FAIL",
+        "FAIL",
+        "FAIL",
+        "FAIL",
+    ]
+    after = {
+        (result["probe"], result["endpoint"]): result["status"]
+        for result in payload["results_after"]
+    }
+    assert after[("idor", "/wallets/{wallet_id}")] == "PASS"
+    assert after[("unauthenticated_access", "/wallets/W_B/transactions")] == "PASS"
+    assert after[("idor", "/wallets/{wallet_id}/transactions")] == "PASS"
+    assert after[("idempotency", "/wallets/W_A/withdraw")] == "FAIL"
     assert payload["agent"]["final_status"] == "PASS"
     assert payload["agent"]["endpoint_tried"] == "/wallets/{wallet_id}"
+    assert payload["agent"]["attempts"] == 1
     assert "403" in payload["diff"]
+    assert payload["auth_agent"]["final_status"] == "PASS"
+    assert payload["auth_agent"]["attempts"] == 1
+    assert payload["auth_agent"]["endpoint_tried"] == AUTH_TEMPLATE
+    assert payload["auth_agent"]["probe_statuses"] == {
+        "unauthenticated_access": "PASS",
+        "idor_transactions": "PASS",
+    }
+    assert "403" in payload["auth_diff"]
 
 
 def test_save_file_has_no_secrets(tmp_path, monkeypatch, capsys) -> None:
@@ -137,8 +178,14 @@ def test_debug_prints_transcript_with_truncated_args(monkeypatch, capsys) -> Non
     monkeypatch.setattr(run_agent, "load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.setenv("GROQ_API_KEY", DUMMY_KEY)
     monkeypatch.setenv("COLUMNS", "200")
+    monkeypatch.setattr(run_agent.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(
-        run_agent, "build_agent", lambda model: build_agent(scripted_model(DEBUG_STEPS))
+        run_agent, "build_agent", lambda model_name: build_agent(scripted_model(DEBUG_STEPS))
+    )
+    monkeypatch.setattr(
+        run_agent,
+        "build_auth_agent",
+        lambda model_name: build_auth_agent(scripted_model([])),
     )
 
     code = run_agent.main(["--debug"])
