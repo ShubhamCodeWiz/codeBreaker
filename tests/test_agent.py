@@ -18,6 +18,7 @@ from pydantic_ai.models.function import FunctionModel
 os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
 
 from code_breaker.agent import (  # noqa: E402
+    TOOL_FAILURE_TEXT,
     AgentDeps,
     RepeatedToolCallError,
     build_agent,
@@ -270,3 +271,88 @@ def test_keyboard_interrupt_escapes_a_tool_call(monkeypatch) -> None:
         cleanup_workspace(workspace)
 
     assert [entry["tool"] for entry in deps.transcript] == ["list_target_endpoints"]
+
+
+HAPPY_STEPS_WITH_WRONG_GUESS = [
+    ("list_target_endpoints", {}),
+    ("run_idor_probe", {"path_template": "/wallets/{wallet_id}"}),
+    ("read_target_file", {"rel_path": "wallets.py"}),
+    ("read_target_file", {"rel_path": MAIN}),
+    ("apply_patch", {"rel_path": MAIN, "old": IDOR_OLD, "new": IDOR_NEW}),
+    ("run_idor_probe", {"path_template": "/wallets/{wallet_id}"}),
+]
+
+
+def test_guessed_path_recovers_via_valid_files_and_reaches_pass() -> None:
+    workspace = make_workspace(REPO_ROOT)
+    try:
+        with run_target(app_dir=str(workspace)) as server:
+            agent = build_agent(scripted_model(HAPPY_STEPS_WITH_WRONG_GUESS))
+            deps = _deps(str(server), workspace)
+            outcome = run_idor_agent(agent, deps)
+    finally:
+        cleanup_workspace(workspace)
+
+    guessed = deps.transcript[2]
+    assert guessed["args"] == {"rel_path": "wallets.py"}
+    assert guessed["result"]["ok"] is False
+    assert MAIN in guessed["result"]["valid_files"]
+    assert outcome["final_status"] == "PASS"
+
+
+def test_list_target_files_tool_reports_paths_and_is_recorded() -> None:
+    workspace = make_workspace(REPO_ROOT)
+    try:
+        with run_target(app_dir=str(workspace)) as server:
+            agent = build_agent(scripted_model([("list_target_files", {})]))
+            deps = _deps(str(server), workspace)
+            run_idor_agent(agent, deps)
+    finally:
+        cleanup_workspace(workspace)
+
+    entry = deps.transcript[0]
+    assert entry["tool"] == "list_target_files"
+    assert MAIN in entry["result"]
+    assert "target_app/__init__.py" in entry["result"]
+
+
+def test_apply_patch_bad_path_also_returns_valid_files() -> None:
+    workspace = make_workspace(REPO_ROOT)
+    try:
+        with run_target(app_dir=str(workspace)) as server:
+            steps = [("apply_patch", {"rel_path": "app/wallets.py", "old": IDOR_OLD, "new": IDOR_NEW})]
+            agent = build_agent(scripted_model(steps))
+            deps = _deps(str(server), workspace)
+            run_idor_agent(agent, deps, max_attempts=1)
+    finally:
+        cleanup_workspace(workspace)
+
+    result = deps.transcript[0]["result"]
+    assert result["ok"] is False
+    assert MAIN in result["valid_files"]
+
+
+def test_path_error_dicts_have_no_raw_exception_message() -> None:
+    workspace = make_workspace(REPO_ROOT)
+    try:
+        with run_target(app_dir=str(workspace)) as server:
+            steps = [
+                ("read_target_file", {"rel_path": "../../etc/passwd"}),
+                ("apply_patch", {"rel_path": "../../etc/passwd", "old": "x", "new": "y"}),
+            ]
+            agent = build_agent(scripted_model(steps))
+            deps = _deps(str(server), workspace)
+            run_idor_agent(agent, deps, max_attempts=2)
+    finally:
+        cleanup_workspace(workspace)
+
+    read_result = deps.transcript[0]["result"]
+    patch_result = deps.transcript[1]["result"]
+
+    # the raised ValueError is replaced by fixed text, never its message
+    assert read_result["message"] == TOOL_FAILURE_TEXT
+    # apply_patch rejects with patch.py's own guard sentence, not an exception message
+    assert patch_result["message"] == "path escapes target_app: ../../etc/passwd"
+    assert "Traceback" not in patch_result["message"]
+    assert MAIN in patch_result["valid_files"]
+    assert "valid_files" in read_result

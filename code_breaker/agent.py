@@ -14,36 +14,34 @@ from code_breaker import patch
 from code_breaker.harness import run_target
 from code_breaker.probes import idor_probe
 
-SYSTEM_PROMPT = """You are code-breaker, a security agent with exactly one job:
-find and fix the IDOR bug on the wallet-read endpoint of the target API.
+SYSTEM_PROMPT = """You are code-breaker, a security agent with one job: find and
+fix the IDOR bug on the wallet-read endpoint of the target API.
 
-Work only through your tools:
-1. Call list_target_endpoints to find the wallet-read endpoint (a GET route
-   containing {wallet_id}).
-2. Confirm the bug with run_idor_probe using that endpoint's path as a
-   template, for example /wallets/{wallet_id}.
-3. Read the Python file that implements it with read_target_file.
-4. Write ONE exact-match edit with apply_patch. `old` must be a snippet that
-   appears exactly once in the current file, and `new` must add an ownership
-   check that returns 403 when the wallet does not belong to the caller.
-5. Re-run run_idor_probe against the same path template to verify the fix.
+Follow this order:
+1. list_target_endpoints and pick the wallet-read endpoint, a GET route
+   containing {wallet_id}.
+2. run_idor_probe on that path template to confirm the bug.
+3. list_target_files and pick the file that contains that route. Every path
+   must come from list_target_files; never guess or invent a file name.
+4. read_target_file on that path. Read a window of about 40 lines around the
+   route if the tool supports start_line/end_line, otherwise read the file once.
+5. apply_patch with ONE exact-match edit that adds an ownership check returning
+   403 when the wallet does not belong to the authenticated caller.
+6. run_idor_probe again on the same path template to verify the fix.
+7. Report only the final probe status (PASS, FAIL or INCONCLUSIVE). Never claim
+   the bug is fixed in your own words.
 
-Tools return an object with "error" when they fail. Read it and correct your
-next call instead of repeating the same arguments. Repeating one identical
-call is a hard error: never send the same tool call twice without changing
-the arguments.
-
-If the probe still does not pass, read the file again and try a different
-exact edit, within the attempt limit you are given. Never claim the bug is
-fixed in your own words: your final answer must report only the final probe
-status (PASS, FAIL or INCONCLUSIVE)."""
+Tools return an object with "error" and "valid_files" when a path fails. Use
+the listed valid_files on your next call instead of guessing another path.
+Repeating one identical call is a hard error: never send the same tool call
+twice without changing the arguments."""
 
 USER_PROMPT = "Find the wallet-read endpoint, confirm the IDOR bug, fix it, and verify the fix."
 
 MAX_RECORDED_CHARS = 2000
 TOOL_FAILURE_TEXT = "tool failed; check the arguments and try again"
 REPEAT_LIMIT = 3
-REQUEST_LIMIT = 10
+REQUEST_LIMIT = 12
 
 
 class RepeatedToolCallError(RuntimeError):
@@ -115,9 +113,25 @@ def _finish(deps: AgentDeps, tool: str, args: dict, result: object) -> None:
         raise RepeatedToolCallError(tool, identical)
 
 
-def _failure(deps: AgentDeps, tool: str, args: dict, error: BaseException) -> dict:
+def _valid_files(workspace: Path) -> list[str]:
+    """The workspace paths the model may use, so it never has to guess a name."""
+    try:
+        return patch.list_files(workspace)
+    except OSError:
+        return []
+
+
+def _failure(
+    deps: AgentDeps,
+    tool: str,
+    args: dict,
+    error: BaseException,
+    with_paths: bool = False,
+) -> dict:
     """Build a fixed-text error result: class name only, never the raw message."""
-    result = {"ok": False, "error": type(error).__name__, "message": TOOL_FAILURE_TEXT}
+    result: dict = {"ok": False, "error": type(error).__name__, "message": TOOL_FAILURE_TEXT}
+    if with_paths:
+        result["valid_files"] = _valid_files(deps.workspace)
     _finish(deps, tool, args, result)
     return result
 
@@ -156,6 +170,14 @@ def build_agent(model=None) -> Agent[AgentDeps, str]:
         return endpoints
 
     @agent.tool
+    def list_target_files(ctx: RunContext[AgentDeps]) -> list[str]:
+        """List the workspace's .py paths, e.g. 'target_app/main.py'; use these, never guess."""
+        args: dict = {}
+        paths = _valid_files(ctx.deps.workspace)
+        _finish(ctx.deps, "list_target_files", args, paths)
+        return paths
+
+    @agent.tool
     def run_idor_probe(ctx: RunContext[AgentDeps], path_template: str) -> dict:
         """Attack the victim's wallet with the attacker's token and return the probe result."""
         args = {"path_template": path_template}
@@ -180,7 +202,7 @@ def build_agent(model=None) -> Agent[AgentDeps, str]:
         try:
             text = patch.read_file(ctx.deps.workspace, rel_path)
         except (ValueError, OSError, httpx.HTTPError) as error:
-            return _failure(ctx.deps, "read_target_file", args, error)
+            return _failure(ctx.deps, "read_target_file", args, error, with_paths=True)
 
         _finish(ctx.deps, "read_target_file", args, text)
         return text
@@ -192,11 +214,13 @@ def build_agent(model=None) -> Agent[AgentDeps, str]:
         try:
             result = patch.apply_edit(ctx.deps.workspace, rel_path, old, new)
         except (ValueError, OSError, httpx.HTTPError) as error:
-            return _failure(ctx.deps, "apply_patch", args, error)
+            return _failure(ctx.deps, "apply_patch", args, error, with_paths=True)
 
         if result.ok and ctx.deps.restart is not None:
             ctx.deps.restart()
-        payload = {"ok": result.ok, "message": result.message, "diff": result.diff}
+        payload: dict = {"ok": result.ok, "message": result.message, "diff": result.diff}
+        if not result.ok:
+            payload["valid_files"] = _valid_files(ctx.deps.workspace)
         _finish(ctx.deps, "apply_patch", args, payload)
         return payload
 
